@@ -4,7 +4,7 @@ import { ColyseusTestServer, boot } from "@colyseus/testing";
 
 import appConfig from "../src/app.config.js";
 import { LobbyState } from "../src/rooms/schema/LobbyState.js";
-import { sanitizeProgress, type LobbyRoom } from "../src/rooms/LobbyRoom.js";
+import { sanitizeProgress, resolveTutorialStep, type LobbyRoom } from "../src/rooms/LobbyRoom.js";
 import { __setPlayersForTest, type PlayerDoc } from "../src/db.js";
 
 // Hand-rolled fake `players` collection implementing only the subset
@@ -263,6 +263,60 @@ describe("LobbyRoom", () => {
     await sleep(50);
     assert.strictEqual(fake.docs.get("u1")!.playTime, 190);
     assert.strictEqual(fake.docs.get("u1")!.level, 2);
+  });
+
+  describe("tutorialStep", () => {
+    it("clamps a saved step to 0..5 and ignores junk", () => {
+      assert.strictEqual(sanitizeProgress({ tutorialStep: 3.9 })!.tutorialStep, 3);
+      assert.strictEqual(sanitizeProgress({ tutorialStep: 99 })!.tutorialStep, 5);
+      assert.strictEqual(sanitizeProgress({ tutorialStep: -2 })!.tutorialStep, 0);
+      assert.strictEqual(sanitizeProgress({ tutorialStep: "4" })!.tutorialStep, undefined);
+    });
+
+    it("resolves legacy docs as finished and raises an undercounted step", () => {
+      // No stored step (predates the field) -> finished.
+      assert.strictEqual(resolveTutorialStep(baseDoc()), 5);
+      // Stored step is kept when stats don't prove more.
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 1 })), 1);
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0 })), 0);
+      // ...but raised when stats prove the player is further along.
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, skill: 30 })), 1);
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, wins: 2 })), 2);
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, equippedStone: "scallop", ownedStones: ["pebble", "scallop"] })), 3);
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, rebirths: 1 })), 5);
+      // Never lowered.
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 4 })), 4);
+    });
+
+    it("persists it via saveProgress and sends it (or noProgress) on join", async () => {
+      const fake = fakePlayersCollection();
+      __setPlayersForTest(fake);
+      const room = await colyseus.createRoom<LobbyState>("lobby", {});
+      const r = room as any;
+      const sent: any[] = [];
+      const origLoad = r.loadProgress.bind(r);
+      r.loadProgress = (c: any, ...rest: any[]) => {
+        const origSend = c.send.bind(c);
+        c.send = (type: string, msg: any) => {
+          sent.push([type, msg]);
+          origSend(type, msg);
+        };
+        return origLoad(c, ...rest);
+      };
+      const first = await colyseus.connectTo(room, { userId: "tut1" });
+      await sleep(100);
+      assert.deepStrictEqual(sent[0], ["noProgress", {}]); // brand-new account
+
+      first.send("saveProgress", { skill: 10, tutorialStep: 2 });
+      await sleep(80);
+      assert.strictEqual(fake.docs.get("tut1")!.tutorialStep, 2);
+
+      sent.length = 0;
+      await colyseus.connectTo(room, { userId: "tut1" }); // evicts `first`, reloads
+      await sleep(100);
+      const progress = sent.find(([t]) => t === "progress");
+      assert.strictEqual(progress[1].tutorialStep, 2);
+    });
   });
 
   describe("sanitizeProgress", () => {

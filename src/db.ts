@@ -24,6 +24,11 @@ export interface PlayerDoc {
   bestSkips: number;
   ownedStones: string[];
   equippedStone: string;
+  // Client onboarding progress (constants.ts TUTORIAL_*): 0..TUTORIAL_DONE_STEP.
+  // Older docs simply lack it -- LobbyRoom.ts's resolveTutorialStep() reads
+  // that as "finished", since onboarding had nowhere durable to resume from
+  // before this field existed.
+  tutorialStep?: number;
   version: number;
   updatedAt: Date;
 }

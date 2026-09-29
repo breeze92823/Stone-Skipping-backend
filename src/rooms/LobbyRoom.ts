@@ -8,6 +8,11 @@ import {
   STONE_IDS,
   DEFAULT_STONE,
   PLAYTIME_FLUSH_MS,
+  TUTORIAL_DONE_STEP,
+  TUTORIAL_SKILL,
+  TUTORIAL_WINS,
+  TUTORIAL_STONE,
+  TUTORIAL_LEVEL,
 } from "../constants.js";
 import { levelForSkill } from "../progression.js";
 import { getPlayers, type PlayerDoc } from "../db.js";
@@ -35,6 +40,27 @@ function dedupeOnline(rows: OnlineRow[], stat: LeaderboardStat): OnlineRow[] {
     if (!existing || row[stat] > existing[stat]) byUserId.set(row.userId, row);
   }
   return [...byUserId.values(), ...anonymous];
+}
+
+// The furthest tutorial step the doc's own stats prove the player has already
+// passed (mirrors client components/Hud.jsx's step conditions).
+function inferMinTutorialStep(doc: PlayerDoc): number {
+  if ((doc.rebirths ?? 0) >= 1) return TUTORIAL_DONE_STEP; // past step 4 (rebirth)
+  if (levelForSkill(doc.skill ?? 0) >= TUTORIAL_LEVEL) return 4; // past step 3
+  if (doc.equippedStone === TUTORIAL_STONE) return 3; // past step 2 (equip)
+  if ((doc.wins ?? 0) >= TUTORIAL_WINS || (doc.ownedStones ?? []).includes(TUTORIAL_STONE)) return 2; // past step 1
+  if ((doc.skill ?? 0) >= TUTORIAL_SKILL) return 1; // past step 0
+  return 0;
+}
+
+// What loadProgress() sends down as tutorialStep. A doc predating the field
+// reads as finished; otherwise the stored step, raised to whatever the stats
+// prove (a stored step that undercounts real progress must never show the
+// player a step they've clearly blown past). Never lowers a stored step.
+// Exported so tests can exercise the rules without a full room round trip.
+export function resolveTutorialStep(doc: PlayerDoc): number {
+  const stored = typeof doc.tutorialStep === "number" ? doc.tutorialStep : TUTORIAL_DONE_STEP;
+  return Math.min(TUTORIAL_DONE_STEP, Math.max(stored, inferMinTutorialStep(doc)));
 }
 
 // Cap on the JSON avatar blob (see LobbyState.ts PlayerState.avatar).
@@ -67,6 +93,11 @@ export function sanitizeProgress(raw: unknown): Partial<PlayerDoc> | null {
   if (finite(src.wins)) out.wins = Math.max(0, Math.floor(src.wins));
   if (finite(src.bestSkips)) out.bestSkips = Math.max(0, Math.floor(src.bestSkips));
 
+  // Only ever moves forward on the client (Hud.jsx latches it), so a save can
+  // safely take whatever is sent, clamped to the valid range.
+  if (finite(src.tutorialStep)) {
+    out.tutorialStep = Math.min(TUTORIAL_DONE_STEP, Math.max(0, Math.floor(src.tutorialStep)));
+  }
   if (Array.isArray(src.ownedStones)) {
     const owned = new Set<string>([DEFAULT_STONE]); // the starter stone is always owned
     for (const id of src.ownedStones) if (typeof id === "string" && KNOWN_STONES.has(id)) owned.add(id);
@@ -272,7 +303,12 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
     if (!players) return;
     try {
       const doc = await players.findOne({ _id: userId });
-      if (!doc) return;
+      if (!doc) {
+        // A brand-new account: tell the client there's nothing to load so it
+        // can start onboarding at step 0 right away instead of waiting on a timeout.
+        client.send("noProgress", {});
+        return;
+      }
       p.skill = doc.skill ?? 0;
       p.level = levelForSkill(p.skill);
       // Saved total (already includes anything flushed while signed in this
@@ -291,6 +327,7 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
         rebirths: doc.rebirths ?? 0,
         wins: doc.wins ?? 0,
         bestSkips: doc.bestSkips ?? 0,
+        tutorialStep: resolveTutorialStep(doc),
         ownedStones,
         equippedStone,
       });
